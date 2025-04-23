@@ -940,6 +940,7 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    LLAMA_API void llama_set_compute_graph_path(const std::string & path, llama_context * ctx);
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
