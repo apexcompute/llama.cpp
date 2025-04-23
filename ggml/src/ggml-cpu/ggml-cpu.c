@@ -14,6 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-profiler.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1726,8 +1727,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
+    // profiling start
+    const char * op_name = ggml_op_name(tensor->op);
+    int thread_id = params->ith;
+
+    ggml_profiler_begin_op(tensor, op_name, thread_id, "ggml-cpu");
+
+
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        ggml_profiler_end_op(tensor, thread_id);
         return;
     }
 
@@ -2071,6 +2080,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
+    ggml_profiler_end_op(tensor, thread_id);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity

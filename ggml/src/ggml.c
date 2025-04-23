@@ -6323,6 +6323,219 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
     GGML_LOG_INFO("%s: dot -Tpng %s -o %s.png && open %s.png\n", __func__, filename, filename, filename);
 }
 
+static void fputs_escaped(const char* str, FILE* fp) {
+    for (const char* p = str; *p; p++) {
+        if (*p == '\\') {
+            fputc('\\', fp);
+        }
+        fputc(*p, fp);
+    }
+}
+
+void ggml_graph_dump_json(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename) {
+    FILE * fp = ggml_fopen(filename, "w");
+    GGML_ASSERT(fp);
+
+    // Start the JSON object
+    fprintf(fp, "{\n");
+
+    // Nodes array
+    fprintf(fp, "  \"nodes\": [\n");
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+        struct ggml_tensor * grad = ggml_graph_get_grad(gb, node);
+
+        // Skip nodes that have a parent
+        if (ggml_graph_get_parent(gb, node) != NULL) {
+            continue;
+        }
+
+        // Node object
+        fprintf(fp, "    {\n");
+        fprintf(fp, "      \"id\": \"%p\",\n", (void *) node);
+        fprintf(fp, "      \"index\": %d,\n", i);
+
+        // Node name
+        if (strlen(node->name) > 0) {
+            fprintf(fp, "      \"name\": \"%s\",\n", node->name);
+        } else {
+            fprintf(fp, "      \"name\": \"\",\n");
+        }
+
+        // Type, dimensions, and operation
+        fprintf(fp, "      \"type\": \"%s\",\n", ggml_type_name(node->type));
+        fprintf(fp, "      \"dimensions\": [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "],\n",
+                node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+
+        // escape backslashes here
+        fprintf(fp, "      \"operation\": \"");
+        fputs_escaped(ggml_op_symbol(node->op), fp);
+        fprintf(fp, "\",\n");
+
+
+        // Node classification
+        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            fprintf(fp, "      \"category\": \"param\",\n");  // Added comma and newline
+        } else if (grad) {
+            if (ggml_graph_find(gf, node)) {
+                fprintf(fp, "      \"category\": \"computed_grad\",\n");  // Added comma and newline
+            } else {
+                fprintf(fp, "      \"category\": \"grad\",\n");  // Added comma and newline
+            }
+        }  else {
+            fprintf(fp, "      \"category\": \"other\",\n");  // Added comma and newline
+        }
+
+        const char * op_name = ggml_op_name(node->op);
+        if (strlen(op_name) > 0) {
+            fprintf(fp, "      \"op_name\": \"%s\"", op_name);
+        } else {
+            fprintf(fp, "      \"op_name\": \"\"");
+        }
+
+        // Add gradient info if present
+        if (grad) {
+            fprintf(fp, ",\n      \"gradient\": {\n");
+            fprintf(fp, "        \"id\": \"%p\",\n", (void *) grad);
+            fprintf(fp, "        \"operation\": \"%s\"\n", ggml_op_symbol(grad->op));
+            fprintf(fp, "      }\n");
+        } else {
+            fprintf(fp, "\n");
+        }
+
+
+
+        // End node object with appropriate comma
+        if (i < gb->n_nodes - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  ],\n");
+
+    // Leaf nodes (constants) array
+    fprintf(fp, "  \"constants\": [\n");
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+
+        // Leaf node object
+        fprintf(fp, "    {\n");
+        fprintf(fp, "      \"id\": \"%p\",\n", (void *) node);
+        fprintf(fp, "      \"index\": %d,\n", i);
+
+        // Name, type, dimensions
+        if (strlen(node->name) > 0) {
+            fprintf(fp, "      \"name\": \"%s\",\n", node->name);
+        } else {
+            fprintf(fp, "      \"name\": \"\",\n");
+        }
+
+        fprintf(fp, "      \"type\": \"%s\",\n", ggml_type_name(node->type));
+        fprintf(fp, "      \"dimensions\": [%" PRId64 ", %" PRId64 "],\n", node->ne[0], node->ne[1]);
+
+        // Add data values if there are only a few
+        if (ggml_nelements(node) < 5 && node->data != NULL) {
+            fprintf(fp, "      \"has_values\": true,\n");
+            fprintf(fp, "      \"values\": [");
+            for (int j = 0; j < ggml_nelements(node); j++) {
+                // Note: Use "#" as placeholder like in the original function
+                fprintf(fp, "\"#\"");
+                if (j < ggml_nelements(node) - 1) {
+                    fprintf(fp, ", ");
+                }
+            }
+            fprintf(fp, "]\n");
+        } else {
+            fprintf(fp, "      \"has_values\": false\n");
+        }
+
+        // End leaf object with appropriate comma
+        if (i < gb->n_leafs - 1) {
+            fprintf(fp, "    },\n");
+        } else {
+            fprintf(fp, "    }\n");
+        }
+    }
+    fprintf(fp, "  ],\n");
+
+    // Edges array
+    fprintf(fp, "  \"edges\": [\n");
+
+    // Count total edges for proper comma formatting
+    int edge_count = 0;
+    int total_edges = 0;
+
+    // Count edges from nodes
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                total_edges++;
+            }
+        }
+    }
+
+    // Count edges from leaf nodes
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                total_edges++;
+            }
+        }
+    }
+
+    // Write edges from nodes
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                fprintf(fp, "    {\n");
+                fprintf(fp, "      \"from\": \"%p\",\n", (void *) node->src[j]);
+                fprintf(fp, "      \"to\": \"%p\",\n", (void *) node);
+                fprintf(fp, "      \"slot\": %d\n", j);
+                edge_count++;
+
+                if (edge_count < total_edges) {
+                    fprintf(fp, "    },\n");
+                } else {
+                    fprintf(fp, "    }\n");
+                }
+            }
+        }
+    }
+
+    // Write edges from leaf nodes
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                fprintf(fp, "    {\n");
+                fprintf(fp, "      \"from\": \"%p\",\n", (void *) node->src[j]);
+                fprintf(fp, "      \"to\": \"%p\",\n", (void *) node);
+                fprintf(fp, "      \"slot\": %d\n", j);
+                edge_count++;
+
+                if (edge_count < total_edges) {
+                    fprintf(fp, "    },\n");
+                } else {
+                    fprintf(fp, "    }\n");
+                }
+            }
+        }
+    }
+
+    fprintf(fp, "  ]\n");
+    fprintf(fp, "}\n");
+
+    fclose(fp);
+
+    GGML_LOG_INFO("%s: JSON output written to %s\n", __func__, filename);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_set_input(struct ggml_tensor * tensor) {

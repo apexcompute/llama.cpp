@@ -1,11 +1,3 @@
-#include "arg.h"
-#include "common.h"
-#include "console.h"
-#include "log.h"
-#include "sampling.h"
-#include "llama.h"
-#include "chat.h"
-
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -15,37 +7,47 @@
 #include <string>
 #include <vector>
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
-#include <signal.h>
-#include <unistd.h>
-#elif defined (_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <signal.h>
+#include "arg.h"
+#include "chat.h"
+#include "common.h"
+#include "console.h"
+#include "ggml-profiler.h"
+#include "llama.h"
+#include "log.h"
+#include "sampling.h"
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#    include <signal.h>
+#    include <unistd.h>
+#elif defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <signal.h>
+#    include <windows.h>
 #endif
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
-static llama_context           ** g_ctx;
-static llama_model             ** g_model;
-static common_sampler          ** g_smpl;
-static common_params            * g_params;
+static llama_context **           g_ctx;
+static llama_model **             g_model;
+static common_sampler **          g_smpl;
+static common_params *            g_params;
 static std::vector<llama_token> * g_input_tokens;
-static std::ostringstream       * g_output_ss;
+static std::ostringstream *       g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
-static bool is_interacting  = false;
-static bool need_insert_eot = false;
+static bool                       is_interacting  = false;
+static bool                       need_insert_eot = false;
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
 
     LOG("\nexample usage:\n");
-    LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n", argv[0]);
+    LOG("\n  text generation:     %s -m your_model.gguf -p \"I believe the meaning of life is\" -n 128 -no-cnv\n",
+        argv[0]);
     LOG("\n  chat (conversation): %s -m your_model.gguf -sys \"You are a helpful assistant\"\n", argv[0]);
     LOG("\n");
 }
@@ -62,7 +64,7 @@ static bool file_is_empty(const std::string & path) {
     return f.tellg() == 0;
 }
 
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
         if (!is_interacting && g_params->interactive) {
@@ -75,6 +77,8 @@ static void sigint_handler(int signo) {
 
             // make sure all logs are flushed
             LOG("Interrupted by user\n");
+            ggml_profiler_shutdown();
+            LOG_INF("%s: profiler shutdown\n", __func__);
             common_log_pause(common_log_main());
 
             _exit(130);
@@ -91,6 +95,37 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+    std::string profile_base = "llama_profile";
+
+    for (int i = 1; i < argc - 1; i++) {
+        if (std::string(argv[i]) == "--profile-output") {
+            profile_base = argv[i + 1];
+            break;
+        }
+    }
+
+    time_t now = time(0);
+    tm* ltm = localtime(&now);
+    char timestamp[20];
+    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
+             1900 + ltm->tm_year, 1 + ltm->tm_mon, ltm->tm_mday,
+             ltm->tm_hour, ltm->tm_min, ltm->tm_sec);
+
+    std::stringstream profile_path_ss;
+    profile_path_ss << profile_base
+                    << "_t" << params.cpuparams.n_threads
+                    << "_" << timestamp;
+
+    std::string profile_path = profile_path_ss.str() + ".perfetto";
+    ggml_profiler_config profiler_config = GGML_PROFILER_DEFAULT_CONFIG;
+    profiler_config.enabled              = true;
+    profiler_config.output_path          = profile_path.c_str();
+    profiler_config.profile_memory       = false;
+    if (!ggml_profiler_init(&profiler_config)) {
+        LOG_INF("%s: profiler failed initialization\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: profiler initialized with output path: %s\n", __func__, profiler_config.output_path);
 
     auto & sparams = params.sampling;
 
@@ -133,13 +168,13 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    llama_model * model = nullptr;
-    llama_context * ctx = nullptr;
-    common_sampler * smpl = nullptr;
+    llama_model *    model = nullptr;
+    llama_context *  ctx   = nullptr;
+    common_sampler * smpl  = nullptr;
 
     g_model = &model;
-    g_ctx = &ctx;
-    g_smpl = &smpl;
+    g_ctx   = &ctx;
+    g_smpl  = &smpl;
 
     std::vector<common_chat_msg> chat_msgs;
 
@@ -148,26 +183,26 @@ int main(int argc, char ** argv) {
     common_init_result llama_init = common_init_from_params(params);
 
     model = llama_init.model.get();
-    ctx = llama_init.context.get();
+    ctx   = llama_init.context.get();
 
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
         return 1;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    auto chat_templates = common_chat_templates_init(model, params.chat_template);
+    const llama_vocab * vocab          = llama_model_get_vocab(model);
+    auto                chat_templates = common_chat_templates_init(model, params.chat_template);
 
     LOG_INF("%s: llama threadpool init, n_threads = %d\n", __func__, (int) params.cpuparams.n_threads);
 
     auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
-    auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
-    auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    auto * ggml_threadpool_new_fn =
+        (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto * ggml_threadpool_free_fn =
+        (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
 
-    struct ggml_threadpool_params tpp_batch =
-            ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
-    struct ggml_threadpool_params tpp =
-            ggml_threadpool_params_from_cpu_params(params.cpuparams);
+    struct ggml_threadpool_params tpp_batch = ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    struct ggml_threadpool_params tpp       = ggml_threadpool_params_from_cpu_params(params.cpuparams);
 
     set_process_priority(params.cpuparams.priority);
 
@@ -192,7 +227,7 @@ int main(int argc, char ** argv) {
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
-    const int n_ctx = llama_n_ctx(ctx);
+    const int n_ctx       = llama_n_ctx(ctx);
 
     if (n_ctx > n_ctx_train) {
         LOG_WRN("%s: model was trained on only %d context tokens (%d specified)\n", __func__, n_ctx_train, n_ctx);
@@ -211,17 +246,23 @@ int main(int argc, char ** argv) {
 
     // in case user force-activate conversation mode (via -cnv) without proper chat template, we show a warning
     if (params.conversation_mode && !has_chat_template) {
-        LOG_WRN("%s: chat template is not available or is not supported. This may cause the model to output suboptimal responses\n", __func__);
+        LOG_WRN(
+            "%s: chat template is not available or is not supported. This may cause the model to output suboptimal "
+            "responses\n",
+            __func__);
     }
 
     // print chat template example in conversation mode
     if (params.conversation_mode) {
         if (params.enable_chat_template) {
             if (!params.prompt.empty() && params.system_prompt.empty()) {
-                LOG_WRN("*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?\n");
+                LOG_WRN(
+                    "*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) "
+                    "instead?\n");
             }
 
-            LOG_INF("%s: chat template example:\n%s\n", __func__, common_chat_format_example(chat_templates.get(), params.use_jinja).c_str());
+            LOG_INF("%s: chat template example:\n%s\n", __func__,
+                    common_chat_format_example(chat_templates.get(), params.use_jinja).c_str());
         } else {
             LOG_INF("%s: in-suffix/prefix is specified, chat template will be disabled\n", __func__);
         }
@@ -234,7 +275,7 @@ int main(int argc, char ** argv) {
         LOG_INF("\n");
     }
 
-    std::string path_session = params.path_prompt_cache;
+    std::string              path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
 
     if (!path_session.empty()) {
@@ -247,12 +288,13 @@ int main(int argc, char ** argv) {
             // The file exists and is not empty
             session_tokens.resize(n_ctx);
             size_t n_token_count_out = 0;
-            if (!llama_state_load_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
+            if (!llama_state_load_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(),
+                                       &n_token_count_out)) {
                 LOG_ERR("%s: failed to load session file '%s'\n", __func__, path_session.c_str());
                 return 1;
             }
             session_tokens.resize(n_token_count_out);
-            LOG_INF("%s: loaded a session with prompt size of %d tokens\n", __func__, (int)session_tokens.size());
+            LOG_INF("%s: loaded a session with prompt size of %d tokens\n", __func__, (int) session_tokens.size());
         }
     }
 
@@ -268,9 +310,10 @@ int main(int argc, char ** argv) {
     bool waiting_for_first_input = false;
     auto chat_add_and_format = [&chat_msgs, &chat_templates](const std::string & role, const std::string & content) {
         common_chat_msg new_msg;
-        new_msg.role = role;
+        new_msg.role    = role;
         new_msg.content = content;
-        auto formatted = common_chat_format_single(chat_templates.get(), chat_msgs, new_msg, role == "user", g_params->use_jinja);
+        auto formatted =
+            common_chat_format_single(chat_templates.get(), chat_msgs, new_msg, role == "user", g_params->use_jinja);
         chat_msgs.push_back(new_msg);
         LOG_DBG("formatted: '%s'\n", formatted.c_str());
         return formatted;
@@ -293,7 +336,7 @@ int main(int argc, char ** argv) {
 
             if (!params.system_prompt.empty() || !params.prompt.empty()) {
                 common_chat_templates_inputs inputs;
-                inputs.messages = chat_msgs;
+                inputs.messages              = chat_msgs;
                 inputs.add_generation_prompt = !params.prompt.empty();
 
                 prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
@@ -349,16 +392,18 @@ int main(int argc, char ** argv) {
             LOG_WRN("%s: session file has low similarity to prompt (%zu / %zu tokens); will mostly be reevaluated\n",
                     __func__, n_matching_session_tokens, embd_inp.size());
         } else {
-            LOG_INF("%s: session file matches %zu / %zu tokens of prompt\n",
-                    __func__, n_matching_session_tokens, embd_inp.size());
+            LOG_INF("%s: session file matches %zu / %zu tokens of prompt\n", __func__, n_matching_session_tokens,
+                    embd_inp.size());
         }
 
         // remove any "future" tokens that we might have inherited from the previous session
         llama_kv_self_seq_rm(ctx, -1, n_matching_session_tokens, -1);
     }
 
-    LOG_DBG("recalculate the cached logits (check): embd_inp.size() %zu, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu\n",
-         embd_inp.size(), n_matching_session_tokens, embd_inp.size(), session_tokens.size());
+    LOG_DBG(
+        "recalculate the cached logits (check): embd_inp.size() %zu, n_matching_session_tokens %zu, embd_inp.size() "
+        "%zu, session_tokens.size() %zu\n",
+        embd_inp.size(), n_matching_session_tokens, embd_inp.size(), session_tokens.size());
 
     // if we will use the cache for the full prompt without reaching the end of the cache, force
     // reevaluation of the last token to recalculate the cached logits
@@ -370,14 +415,14 @@ int main(int argc, char ** argv) {
 
     // number of tokens to keep when resetting context
     if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size()) {
-        params.n_keep = (int)embd_inp.size();
+        params.n_keep = (int) embd_inp.size();
     } else {
-        params.n_keep += add_bos; // always keep the BOS token
+        params.n_keep += add_bos;  // always keep the BOS token
     }
 
     if (params.conversation_mode) {
         if (params.single_turn && !params.prompt.empty()) {
-            params.interactive = false;
+            params.interactive       = false;
             params.interactive_first = false;
         } else {
             params.interactive_first = true;
@@ -408,13 +453,13 @@ int main(int argc, char ** argv) {
 
     // ctrl+C handling
     {
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
         struct sigaction sigint_action;
         sigint_action.sa_handler = sigint_handler;
-        sigemptyset (&sigint_action.sa_mask);
+        sigemptyset(&sigint_action.sa_mask);
         sigint_action.sa_flags = 0;
         sigaction(SIGINT, &sigint_action, NULL);
-#elif defined (_WIN32)
+#elif defined(_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
         };
@@ -468,11 +513,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    LOG_INF("sampler seed: %u\n",     common_sampler_get_seed(smpl));
+    LOG_INF("sampler seed: %u\n", common_sampler_get_seed(smpl));
     LOG_INF("sampler params: \n%s\n", sparams.print().c_str());
-    LOG_INF("sampler chain: %s\n",    common_sampler_print(smpl).c_str());
+    LOG_INF("sampler chain: %s\n", common_sampler_print(smpl).c_str());
 
-    LOG_INF("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
+    LOG_INF("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch,
+            params.n_predict, params.n_keep);
 
     // group-attention state
     // number of grouped KV tokens so far (used only if params.grp_attn_n > 1)
@@ -482,10 +528,10 @@ int main(int argc, char ** argv) {
     const int ga_w = params.grp_attn_w;
 
     if (ga_n != 1) {
-        GGML_ASSERT(ga_n > 0                    && "grp_attn_n must be positive");                     // NOLINT
-        GGML_ASSERT(ga_w % ga_n == 0            && "grp_attn_w must be a multiple of grp_attn_n");     // NOLINT
-      //GGML_ASSERT(n_ctx_train % ga_w == 0     && "n_ctx_train must be a multiple of grp_attn_w");    // NOLINT
-      //GGML_ASSERT(n_ctx >= n_ctx_train * ga_n && "n_ctx must be at least n_ctx_train * grp_attn_n"); // NOLINT
+        GGML_ASSERT(ga_n > 0 && "grp_attn_n must be positive");                          // NOLINT
+        GGML_ASSERT(ga_w % ga_n == 0 && "grp_attn_w must be a multiple of grp_attn_n");  // NOLINT
+        //GGML_ASSERT(n_ctx_train % ga_w == 0     && "n_ctx_train must be a multiple of grp_attn_w");    // NOLINT
+        //GGML_ASSERT(n_ctx >= n_ctx_train * ga_n && "n_ctx must be at least n_ctx_train * grp_attn_n"); // NOLINT
         LOG_INF("self-extend: n_ctx_train = %d, grp_attn_n = %d, grp_attn_w = %d\n", n_ctx_train, ga_n, ga_w);
     }
     LOG_INF("\n");
@@ -493,20 +539,22 @@ int main(int argc, char ** argv) {
     if (params.interactive) {
         const char * control_message;
         if (params.multiline_input) {
-            control_message = " - To return control to the AI, end your input with '\\'.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n";
+            control_message =
+                " - To return control to the AI, end your input with '\\'.\n"
+                " - To return control without starting a new line, end your input with '/'.\n";
         } else {
-            control_message = " - Press Return to return control to the AI.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n"
-                              " - If you want to submit another line, end your input with '\\'.\n";
+            control_message =
+                " - Press Return to return control to the AI.\n"
+                " - To return control without starting a new line, end your input with '/'.\n"
+                " - If you want to submit another line, end your input with '\\'.\n";
         }
         LOG_INF("== Running in interactive mode. ==\n");
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
-        LOG_INF(       " - Press Ctrl+C to interject at any time.\n");
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(_WIN32)
+        LOG_INF(" - Press Ctrl+C to interject at any time.\n");
 #endif
-        LOG_INF(       "%s", control_message);
+        LOG_INF("%s", control_message);
         if (params.conversation_mode && params.enable_chat_template && params.system_prompt.empty()) {
-            LOG_INF(   " - Not using system message. To change it, set a different value via -sys PROMPT\n");
+            LOG_INF(" - Not using system message. To change it, set a different value via -sys PROMPT\n");
         }
         LOG_INF("\n");
 
@@ -523,10 +571,13 @@ int main(int argc, char ** argv) {
     int n_consumed         = 0;
     int n_session_consumed = 0;
 
-    std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
-    std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
-    std::ostringstream output_ss;     g_output_ss     = &output_ss;
-    std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
+    std::vector<int> input_tokens;
+    g_input_tokens = &input_tokens;
+    std::vector<int> output_tokens;
+    g_output_tokens = &output_tokens;
+    std::ostringstream output_ss;
+    g_output_ss = &output_ss;
+    std::ostringstream assistant_ss;  // for storing current assistant message, used in conversation mode
 
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(console::prompt);
@@ -545,8 +596,8 @@ int main(int argc, char ** argv) {
     }
 
     if (llama_model_has_encoder(model)) {
-        int enc_input_size = embd_inp.size();
-        llama_token * enc_input_buf = embd_inp.data();
+        int           enc_input_size = embd_inp.size();
+        llama_token * enc_input_buf  = embd_inp.data();
 
         if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
             LOG_ERR("%s : failed to eval\n", __func__);
@@ -586,7 +637,7 @@ int main(int argc, char ** argv) {
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
 
                 if (n_past + (int) embd.size() >= n_ctx) {
-                    if (!params.ctx_shift){
+                    if (!params.ctx_shift) {
                         LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
                         break;
                     }
@@ -597,13 +648,14 @@ int main(int argc, char ** argv) {
                     }
 
                     const int n_left    = n_past - params.n_keep;
-                    const int n_discard = n_left/2;
+                    const int n_discard = n_left / 2;
 
-                    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
-                            n_past, n_left, n_ctx, params.n_keep, n_discard);
+                    LOG_DBG(
+                        "context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
+                        n_past, n_left, n_ctx, params.n_keep, n_discard);
 
-                    llama_kv_self_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                    llama_kv_self_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
+                    llama_kv_cache_seq_rm(ctx, 0, params.n_keep, params.n_keep + n_discard);
+                    llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
 
                     n_past -= n_discard;
 
@@ -617,22 +669,25 @@ int main(int argc, char ** argv) {
             } else {
                 // context extension via Self-Extend
                 while (n_past >= ga_i + ga_w) {
-                    const int ib = (ga_n*ga_i)/ga_w;
-                    const int bd = (ga_w/ga_n)*(ga_n - 1);
-                    const int dd = (ga_w/ga_n) - ib*bd - ga_w;
+                    const int ib = (ga_n * ga_i) / ga_w;
+                    const int bd = (ga_w / ga_n) * (ga_n - 1);
+                    const int dd = (ga_w / ga_n) - ib * bd - ga_w;
 
                     LOG_DBG("\n");
-                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i, n_past, ib*bd, ga_i + ib*bd, n_past + ib*bd);
-                    LOG_DBG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib*bd, ga_i + ib*bd + ga_w, ga_n, (ga_i + ib*bd)/ga_n, (ga_i + ib*bd + ga_w)/ga_n);
-                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib*bd + ga_w, n_past + ib*bd, dd, ga_i + ib*bd + ga_w + dd, n_past + ib*bd + dd);
+                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i, n_past, ib * bd, ga_i + ib * bd,
+                            n_past + ib * bd);
+                    LOG_DBG("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", ga_i + ib * bd, ga_i + ib * bd + ga_w, ga_n,
+                            (ga_i + ib * bd) / ga_n, (ga_i + ib * bd + ga_w) / ga_n);
+                    LOG_DBG("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", ga_i + ib * bd + ga_w, n_past + ib * bd, dd,
+                            ga_i + ib * bd + ga_w + dd, n_past + ib * bd + dd);
 
-                    llama_kv_self_seq_add(ctx, 0, ga_i,                n_past,              ib*bd);
-                    llama_kv_self_seq_div(ctx, 0, ga_i + ib*bd,        ga_i + ib*bd + ga_w, ga_n);
-                    llama_kv_self_seq_add(ctx, 0, ga_i + ib*bd + ga_w, n_past + ib*bd,      dd);
+                    llama_kv_cache_seq_add(ctx, 0, ga_i, n_past, ib * bd);
+                    llama_kv_cache_seq_div(ctx, 0, ga_i + ib * bd, ga_i + ib * bd + ga_w, ga_n);
+                    llama_kv_cache_seq_add(ctx, 0, ga_i + ib * bd + ga_w, n_past + ib * bd, dd);
 
                     n_past -= bd;
 
-                    ga_i += ga_w/ga_n;
+                    ga_i += ga_w / ga_n;
 
                     LOG_DBG("\nn_past_old = %d, n_past = %d, ga_i = %d\n\n", n_past + bd, n_past, ga_i);
                 }
@@ -641,7 +696,7 @@ int main(int argc, char ** argv) {
             // try to reuse a matching prefix from the loaded session instead of re-eval (via n_past)
             if (n_session_consumed < (int) session_tokens.size()) {
                 size_t i = 0;
-                for ( ; i < embd.size(); i++) {
+                for (; i < embd.size(); i++) {
                     if (embd[i] != session_tokens[n_session_consumed]) {
                         session_tokens.resize(n_session_consumed);
                         break;
@@ -667,12 +722,11 @@ int main(int argc, char ** argv) {
                 }
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
-
+                ggml_profiler_record_event(NULL, "batch_eval_start", i, 0);
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
                 }
-
                 n_past += n_eval;
 
                 LOG_DBG("n_past = %d\n", n_past);
@@ -699,6 +753,7 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
+            ggml_profiler_record_event(NULL, "token_sampling", 0, 0);
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
@@ -717,6 +772,7 @@ int main(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
+            ggml_profiler_record_event(NULL, "prompt_evaluation_start", 0, 0);
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 
@@ -729,6 +785,7 @@ int main(int argc, char ** argv) {
                     break;
                 }
             }
+            ggml_profiler_record_event(NULL, "prompt_evaluation_end", 0, 0);
         }
 
         // display text
@@ -762,7 +819,7 @@ int main(int argc, char ** argv) {
         if ((int) embd_inp.size() <= n_consumed) {
             // check for reverse prompt in the last n_prev tokens
             if (!params.antiprompt.empty()) {
-                const int n_prev = 32;
+                const int         n_prev      = 32;
                 const std::string last_output = common_sampler_prev_str(smpl, ctx, n_prev);
 
                 is_antiprompt = false;
@@ -771,9 +828,10 @@ int main(int argc, char ** argv) {
                 // so we'll compensate for that by widening the search window a bit.
                 for (std::string & antiprompt : params.antiprompt) {
                     size_t extra_padding = params.interactive ? 0 : 2;
-                    size_t search_start_pos = last_output.length() > static_cast<size_t>(antiprompt.length() + extra_padding)
-                        ? last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding)
-                        : 0;
+                    size_t search_start_pos =
+                        last_output.length() > static_cast<size_t>(antiprompt.length() + extra_padding) ?
+                            last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding) :
+                            0;
 
                     if (last_output.find(antiprompt, search_start_pos) != std::string::npos) {
                         if (params.interactive) {
@@ -855,7 +913,7 @@ int main(int argc, char ** argv) {
                 display = params.display_prompt;
 
                 std::string line;
-                bool another_line = true;
+                bool        another_line = true;
                 do {
                     another_line = console::readline(line, params.multiline_input);
                     buffer += line;
@@ -895,13 +953,12 @@ int main(int argc, char ** argv) {
                         string_process_escapes(buffer);
                     }
 
-                    bool format_chat = params.conversation_mode && params.enable_chat_template;
-                    std::string user_inp = format_chat
-                        ? chat_add_and_format("user", std::move(buffer))
-                        : std::move(buffer);
+                    bool        format_chat = params.conversation_mode && params.enable_chat_template;
+                    std::string user_inp =
+                        format_chat ? chat_add_and_format("user", std::move(buffer)) : std::move(buffer);
                     // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);
-                    const auto line_inp = common_tokenize(ctx, user_inp,            false, format_chat);
+                    const auto line_inp = common_tokenize(ctx, user_inp, false, format_chat);
                     const auto line_sfx = common_tokenize(ctx, params.input_suffix, false, true);
 
                     LOG_DBG("input tokens: %s\n", string_from(ctx, line_inp).c_str());
@@ -930,7 +987,7 @@ int main(int argc, char ** argv) {
                     LOG_DBG("n_remain: %d\n", n_remain);
                 }
 
-                input_echo = false; // do not echo this again
+                input_echo = false;  // do not echo this again
             }
 
             if (n_past > 0 || waiting_for_first_input) {
@@ -940,7 +997,7 @@ int main(int argc, char ** argv) {
                 is_interacting = false;
 
                 if (waiting_for_first_input && params.single_turn) {
-                    params.interactive = false;
+                    params.interactive       = false;
                     params.interactive_first = false;
                 }
                 waiting_for_first_input = false;
@@ -956,7 +1013,7 @@ int main(int argc, char ** argv) {
         // In interactive mode, respect the maximum number of tokens and drop back to user input when reached.
         // We skip this logic when n_predict == -1 (infinite) or -2 (stop at context size).
         if (params.interactive && n_remain <= 0 && params.n_predict >= 0) {
-            n_remain = params.n_predict;
+            n_remain       = params.n_predict;
             is_interacting = true;
         }
     }
@@ -972,6 +1029,8 @@ int main(int argc, char ** argv) {
     common_sampler_free(smpl);
 
     llama_backend_free();
+    ggml_profiler_shutdown();
+    LOG_INF("%s: profiler shutdown\n", __func__);
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
