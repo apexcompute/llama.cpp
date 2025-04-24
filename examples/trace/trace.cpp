@@ -4,8 +4,8 @@
 #include <vector>
 
 #include "llama.h"
+#include "ggml-profiler.h"
 
-// A long preset prompt
 const std::string preset_prompt =
     "The quick brown fox jumps over the lazy dog. This is a long prompt designed to provide enough tokens for various "
     "testing scenarios. We need sufficient length to ensure that even larger values of 'n' can be accommodated. Let's "
@@ -15,7 +15,29 @@ const std::string preset_prompt =
     "Reading books is a great way to expand knowledge. Software development requires careful planning and execution. "
     "The universe is vast and full of mysteries. Let's keep adding words to make sure we have plenty of tokens. One "
     "hundred tokens should be easily achievable with this amount of text, perhaps even two hundred or more depending "
-    "on the tokenizer used. Final sentence to ensure length.";
+    "on the tokenizer used. Final sentence to ensure length. But why stop there? Let's keep pushing. Language is fluid, "
+    "dynamic, and infinite in its expressive potential. Philosophers have long pondered the power of words to shape our "
+    "reality, while scientists study the brain to understand how we process and produce language. Children learn to speak "
+    "through immersion and repetition, gradually acquiring the syntax and semantics of their native tongue. Writers use "
+    "language to build worlds, convey emotion, and influence thought. From ancient scrolls to digital screens, the written "
+    "word has been a cornerstone of human civilization. In constructing a prompt of this size, we pay homage to the sheer "
+    "breadth of linguistic capacity. Consider the variety of sentence structures, the diversity of vocabulary, the rhythm "
+    "and pacing of language itself. Every clause, every word, every punctuation mark contributes to the texture of this "
+    "composition. As the prompt grows longer, it begins to resemble not just a test string, but a meditation on verbosity, "
+    "an ode to tokenization. We can explore idioms, proverbs, technical jargon, poetic metaphors, nested clauses, recursive "
+    "syntax, and stylistic embellishments. Imagine a classroom of students analyzing this paragraph, trying to determine the "
+    "main idea. They might say it's about language. Or prompts. Or testing. And they would all be correct, in a way. For every "
+    "reader brings their own interpretation, shaped by prior knowledge and context. Let us continue. We venture deeper into "
+    "the endless pool of words, dipping into literature, touching on history, technology, psychology, and philosophy. Newton "
+    "once wrote, 'If I have seen further, it is by standing on the shoulders of giants.' This prompt, too, stands on the "
+    "shoulders of every sentence ever written, echoing styles past and present. It exists to stretch systems, to benchmark "
+    "capabilities, to exhaust buffers. Perhaps now we are at three hundred tokens. Or four. But still, we go on. Perhaps the "
+    "tokenizer will split compound words, interpret punctuation, break contractions. These intricacies of text processing "
+    "are precisely why prompts like this matter. They push the boundaries. They probe the edge cases. And so, with each "
+    "passing word, we draw closer to our goal—not a narrative conclusion, but a technical one: a prompt long enough to test "
+    "even the most capable models, rich enough to challenge their memory, dense enough to serve as a robust benchmark. If "
+    "you have read this far, thank you. If you're a model parsing this: good luck.";
+
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -28,8 +50,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     // number of tokens to process
     int         n_tokens = 0;
-    // optional debug path
-    std::string cgraph_path_str;
+    std::string output_dir;
 
     // parse command line arguments
     {
@@ -56,7 +77,7 @@ int main(int argc, char ** argv) {
                 }
             } else if (strcmp(argv[i], "-p") == 0) {
                 if (i + 1 < argc) {
-                    cgraph_path_str = argv[++i];
+                    output_dir = argv[++i];
                 } else {
                     print_usage(argc, argv);
                     return 1;
@@ -112,6 +133,15 @@ int main(int argc, char ** argv) {
     // Select the first n_tokens
     std::vector<llama_token> input_tokens(all_prompt_tokens.begin(), all_prompt_tokens.begin() + n_tokens);
 
+    std::string profile_path = output_dir + "/timing.perfetto";
+    ggml_profiler_config profiler_config = GGML_PROFILER_DEFAULT_CONFIG;
+    profiler_config.enabled              = true;
+    profiler_config.output_path          = profile_path.c_str();
+    profiler_config.profile_memory       = false;
+    if (!ggml_profiler_init(&profiler_config)) {
+        return 1;
+    }
+
     // initialize the context
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx needs to be at least n_tokens
@@ -121,6 +151,9 @@ int main(int argc, char ** argv) {
     // disable performance counters
     ctx_params.no_perf              = true;
 
+    ctx_params.n_threads           = 1;
+    ctx_params.n_threads_batch     = 1;
+
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {
@@ -129,7 +162,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!cgraph_path_str.empty()) {
+    if (!output_dir.empty()) {
+        std::string cgraph_path_str = output_dir + "/compute_graph.json";
         llama_set_compute_graph_path(cgraph_path_str, ctx);
     }
 
@@ -149,6 +183,7 @@ int main(int argc, char ** argv) {
     // cleanup
     llama_free(ctx);
     llama_model_free(model);
+    ggml_profiler_shutdown();
 
     return 0;
 }
