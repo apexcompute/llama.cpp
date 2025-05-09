@@ -65,7 +65,7 @@ const std::string preset_prompt =
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf -n n_tokens [-p cgraph_path]\n", argv[0]);
+    printf("\n    %s -m model.gguf -n n_tokens [-p cgraph_path] [-t \"custom prompt\"]\n", argv[0]);
     printf("\n");
 }
 
@@ -75,6 +75,8 @@ int main(int argc, char ** argv) {
     // number of tokens to process
     int               n_tokens = 0;
     std::string       output_dir;
+    // Custom prompt (if provided)
+    std::string       custom_prompt;
     // Fixed dump file location
     const std::string dump_file = "out/dump.txt";
 
@@ -108,13 +110,26 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "-t") == 0) {
+                if (i + 1 < argc) {
+                    custom_prompt = argv[++i];
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else {
                 fprintf(stderr, "Unknown argument: %s\n", argv[i]);
                 print_usage(argc, argv);
                 return 1;
             }
         }
-        if (model_path.empty() || n_tokens <= 0) {
+        // Model is always required
+        if (model_path.empty()) {
+            print_usage(argc, argv);
+            return 1;
+        }
+        // Either custom prompt or n_tokens must be provided
+        if (custom_prompt.empty() && n_tokens <= 0) {
             print_usage(argc, argv);
             return 1;
         }
@@ -136,28 +151,50 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // tokenize the preset prompt
-    // First, find the total number of tokens in the preset prompt
-    const int n_prompt_total = -llama_tokenize(vocab, preset_prompt.c_str(), preset_prompt.size(), NULL, 0, true, true);
-    if (n_prompt_total < n_tokens) {
-        fprintf(stderr,
-                "%s: error: requested n_tokens (%d) is greater than the total tokens in the preset prompt (%d)\n",
-                __func__, n_tokens, n_prompt_total);
-        llama_model_free(model);
-        return 1;
-    }
+    // tokenize the prompt (either custom or preset)
+    std::vector<llama_token> input_tokens;
+    const std::string &      prompt_to_use = custom_prompt.empty() ? preset_prompt : custom_prompt;
 
-    // Allocate space for all tokens and tokenize the prompt
-    std::vector<llama_token> all_prompt_tokens(n_prompt_total);
-    if (llama_tokenize(vocab, preset_prompt.c_str(), preset_prompt.size(), all_prompt_tokens.data(),
-                       all_prompt_tokens.size(), true, true) < 0) {
-        fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
-        llama_model_free(model);
-        return 1;
-    }
+    if (custom_prompt.empty()) {
+        // Using preset prompt with n_tokens
+        // First, find the total number of tokens in the preset prompt
+        const int n_prompt_total =
+            -llama_tokenize(vocab, preset_prompt.c_str(), preset_prompt.size(), NULL, 0, true, true);
+        if (n_prompt_total < n_tokens) {
+            fprintf(stderr,
+                    "%s: error: requested n_tokens (%d) is greater than the total tokens in the preset prompt (%d)\n",
+                    __func__, n_tokens, n_prompt_total);
+            llama_model_free(model);
+            return 1;
+        }
 
-    // Select the first n_tokens
-    std::vector<llama_token> input_tokens(all_prompt_tokens.begin(), all_prompt_tokens.begin() + n_tokens);
+        // Allocate space for all tokens and tokenize the prompt
+        std::vector<llama_token> all_prompt_tokens(n_prompt_total);
+        if (llama_tokenize(vocab, preset_prompt.c_str(), preset_prompt.size(), all_prompt_tokens.data(),
+                           all_prompt_tokens.size(), true, true) < 0) {
+            fprintf(stderr, "%s: error: failed to tokenize the prompt\n", __func__);
+            llama_model_free(model);
+            return 1;
+        }
+
+        // Select the first n_tokens
+        input_tokens.assign(all_prompt_tokens.begin(), all_prompt_tokens.begin() + n_tokens);
+    } else {
+        // Using custom prompt (use all tokens)
+        const int n_tokens_custom =
+            -llama_tokenize(vocab, custom_prompt.c_str(), custom_prompt.size(), NULL, 0, true, true);
+        input_tokens.resize(n_tokens_custom);
+
+        if (llama_tokenize(vocab, custom_prompt.c_str(), custom_prompt.size(), input_tokens.data(), input_tokens.size(),
+                           true, true) < 0) {
+            fprintf(stderr, "%s: error: failed to tokenize the custom prompt\n", __func__);
+            llama_model_free(model);
+            return 1;
+        }
+
+        // Update n_tokens to the actual number of tokens in the custom prompt
+        n_tokens = input_tokens.size();
+    }
 
     std::string          profile_path    = output_dir + "/timing.perfetto";
     ggml_profiler_config profiler_config = GGML_PROFILER_DEFAULT_CONFIG;
